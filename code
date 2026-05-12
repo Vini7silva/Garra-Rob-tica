@@ -1,0 +1,160 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <Preferences.h>
+
+const int pins[] = {13, 12, 14, 27};
+Servo servos[4]; // Array corrigido para 4 motores
+
+int posAtuais[] = {90, 90, 90, 90};
+int memorias[10][4]; 
+int passoVelocidade = 1; 
+
+bool executando = false;
+bool modoLoop = false;
+int sequencia[50];
+int tamSeq = 0, passoAtual = 0;
+unsigned long lastUpdate = 0;
+
+Preferences prefs;
+WebServer server(80);
+
+const char PAGE[] PROGMEM = R"=====(
+<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>
+<style>
+  body { font-family: sans-serif; text-align: center; background: #0f0f0f; color: #eee; margin:0; padding:10px; }
+  .card { background: #1a1a1a; margin: 8px auto; padding: 12px; border-radius: 10px; border: 1px solid #444; max-width: 480px; }
+  .slider { width: 95%; height: 35px; accent-color: #00d4ff; }
+  .speed-slider { accent-color: #ff9f43; }
+  .grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin: 10px 0; }
+  button { padding: 12px 2px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; color: white; }
+  .btn-rec { background: #e84118; } .btn-play { background: #4cd137; }
+  .btn-all { background: #0097e6; width: 48%; padding: 15px; }
+  .btn-stop { background: #ff3f34; width: 100%; padding: 15px; margin-top:10px; }
+  input[type="text"] { width: 90%; padding: 12px; background: #333; color: white; border: 1px solid #555; text-align: center; border-radius: 5px;}
+</style></head><body>
+  <h3>🤖 Garra Pro v4.2</h3>
+  <div class="card" style="border: 2px solid #ff9f43;">
+    <strong>VELOCIDADE: <span id="vLab">1</span></strong><br>
+    <input type="range" class="slider speed-slider" min="1" max="15" value="1" oninput="vChange(this.value)">
+  </div>
+  <div id="controls"></div>
+  <div class="card">
+    <div class="grid" id="btns"></div>
+    <input type="text" id="seqIn" value="1,2,3">
+    <div style="display:flex; justify-content: space-around; gap:5px; margin-top:10px;">
+      <button class="btn-all" onclick="go(0)">PLAY</button>
+      <button class="btn-all" style="background:#8c7ae6" onclick="go(1)">LOOP</button>
+    </div>
+    <button class="btn-stop" onclick="fetch('/stop')">PARAR</button>
+  </div>
+  <script>
+    function vChange(v) { document.getElementById('vLab').innerText = v; fetch('/speed?v='+v); }
+    for(let i=0; i<4; i++) {
+      let min = (i==3)?55:0; let max = (i==3)?130:180; // ATUALIZADO: 130 graus para o Servo 4
+      document.getElementById('controls').innerHTML += `<div class="card">SERVO ${i+1}: <span id="v${i}">90</span>°<br>
+      <input type="range" class="slider" min="${min}" max="${max}" value="90" oninput="move(${i}, this.value)"></div>`;
+    }
+    const b = document.getElementById('btns');
+    for(let i=0; i<10; i++) b.innerHTML += `<button class="btn-rec" onclick="fetch('/rec?m=${i}')">REC${i+1}</button>`;
+    for(let i=0; i<10; i++) b.innerHTML += `<button class="btn-play" onclick="fetch('/play?m=${i}')">P${i+1}</button>`;
+    function move(i, v) { document.getElementById('v'+i).innerText = v; fetch(`/set?i=${i}&v=${v}`); }
+    function go(l) { fetch(`/pSeq?s=${document.getElementById('seqIn').value}&l=${l}`); }
+  </script>
+</body></html>
+)=====";
+
+void processarMovimento() {
+  if (!executando) return;
+  int* alvos = memorias[sequencia[passoAtual] - 1];
+  bool todosNoAlvo = true;
+
+  for (int i = 0; i < 4; i++) {
+    int diff = alvos[i] - posAtuais[i];
+    if (abs(diff) > 0) {
+      todosNoAlvo = false;
+      int m = constrain(diff, -passoVelocidade, passoVelocidade);
+      posAtuais[i] += m;
+      servos[i].write(posAtuais[i]);
+    }
+  }
+
+  if (todosNoAlvo) {
+    static unsigned long pTime = 0;
+    if (pTime == 0) pTime = millis();
+    if (millis() - pTime > 400) { 
+      pTime = 0; passoAtual++;
+      if (passoAtual >= tamSeq) {
+        if (modoLoop) passoAtual = 0;
+        else executando = false;
+      }
+    }
+  }
+}
+
+void setup() {
+  prefs.begin("garra", false);
+  for(int i=0; i<10; i++) {
+    for(int j=0; j<4; j++) memorias[i][j] = prefs.getInt(("m"+String(i)+String(j)).c_str(), 90);
+  }
+  
+  WiFi.softAP("GARRA_PRO_FINAL", "12345678");
+  
+  for(int i=0; i<4; i++) {
+    servos[i].setPeriodHertz(50);
+    servos[i].attach(pins[i], 500, 2400);
+    // Ajuste inicial para o Servo 4 se estiver fora do limite
+    if(i==3) posAtuais[i] = constrain(posAtuais[i], 55, 130);
+    servos[i].write(posAtuais[i]);
+  }
+
+  server.on("/", []() { server.send(200, "text/html", PAGE); });
+  
+  server.on("/set", []() {
+    int i = server.arg("i").toInt(); int v = server.arg("v").toInt();
+    if(i==3) v = constrain(v, 55, 130); // ATUALIZADO: Segurança no servidor
+    servos[i].write(v); posAtuais[i] = v; server.send(200);
+  });
+
+  server.on("/speed", []() { passoVelocidade = server.arg("v").toInt(); server.send(200); });
+
+  server.on("/rec", []() {
+    int m = server.arg("m").toInt();
+    for(int i=0; i<4; i++) {
+      memorias[m][i] = posAtuais[i];
+      prefs.putInt(("m"+String(m)+String(i)).c_str(), posAtuais[i]);
+    }
+    server.send(200);
+  });
+
+  server.on("/play", []() {
+    int m = server.arg("m").toInt();
+    sequencia[0] = m + 1;
+    tamSeq = 1; passoAtual = 0; executando = true; modoLoop = false;
+    server.send(200);
+  });
+
+  server.on("/pSeq", []() {
+    String s = server.arg("s"); modoLoop = server.arg("l").toInt();
+    tamSeq = 0;
+    while(s.length() > 0 && tamSeq < 50) {
+      int idx = s.indexOf(',');
+      int val = (idx == -1) ? s.toInt() : s.substring(0, idx).toInt();
+      if(val >= 1 && val <= 10) sequencia[tamSeq++] = val;
+      if(idx == -1) break;
+      s = s.substring(idx + 1);
+    }
+    passoAtual = 0; executando = true; server.send(200);
+  });
+
+  server.on("/stop", []() { executando = false; modoLoop = false; server.send(200); });
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  if (executando && millis() - lastUpdate > 20) {
+    processarMovimento();
+    lastUpdate = millis();
+  }
+}
